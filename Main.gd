@@ -91,6 +91,11 @@ var _finger_splay_signs: Array[float] = [0.0, 0.0, 0.0, 0.0, 0.0]
 var _bones_ready := false
 var _visibility_applied := false
 var _wrist_bind_quat := Quaternion.IDENTITY
+var _demo_mode := false
+var _demo_bend := 0.0
+
+const _DEFAULT_FLEX_CLOSED: Array[float] = [680.0, 422.0, 624.0, 540.0, 535.0]
+const _MIN_FLEX_SPAN_WARN := 25.0
 
 const _WRIST_CANDIDATES: Array[String] = [
 	"hand.R", "hand.R_02", "hand.R.001", "RightHand", "mixamorig:RightHand",
@@ -170,9 +175,20 @@ func _input(event: InputEvent) -> void:
 				_cycle_mount_preset()
 			KEY_P:
 				_print_bone_names()
+			KEY_T:
+				_toggle_demo_mode()
+			KEY_EQUAL, KEY_KP_ADD:
+				_adjust_demo_bend(0.05)
+			KEY_MINUS, KEY_KP_SUBTRACT:
+				_adjust_demo_bend(-0.05)
 
 
 func _process(delta: float) -> void:
+	if _demo_mode:
+		_drain_udp_packets()
+		_apply_demo_scene(delta)
+		return
+
 	if not _udp_ready:
 		return
 
@@ -215,6 +231,13 @@ func _parse_packet(data_str: String) -> void:
 		_flex_recent.pop_front()
 	if _packet_count == 1:
 		print("First UDP packet received")
+
+
+func _drain_udp_packets() -> void:
+	if not _udp_ready:
+		return
+	while udp_peer.get_available_packet_count() > 0:
+		udp_peer.get_packet()
 
 
 func _setup_skeleton() -> void:
@@ -771,6 +794,35 @@ func _sync_flex_closed_from_exports() -> void:
 	]
 
 
+func _default_flex_closed(finger: int) -> float:
+	if finger < 0 or finger >= 5:
+		return 600.0
+	return _DEFAULT_FLEX_CLOSED[finger]
+
+
+func _validate_flex_closed() -> void:
+	var labels := ["thumb", "index", "middle", "ring", "pinky"]
+	var repaired := false
+	for i in 5:
+		var open_v := _flex_open_value(i)
+		var span := open_v - flex_closed_finger[i]
+		if flex_closed_finger[i] >= open_v:
+			var fallback := minf(_default_flex_closed(i), open_v - _MIN_FLEX_SPAN_WARN)
+			push_warning(
+				"Finger %s: flex_closed %.0f >= open %.0f, reset to %.0f"
+				% [labels[i], flex_closed_finger[i], open_v, fallback]
+			)
+			flex_closed_finger[i] = fallback
+			repaired = true
+		elif span < _MIN_FLEX_SPAN_WARN:
+			push_warning(
+				"Finger %s: flex span only %.0f ADC — re-calibrate with F if bending is weak"
+				% [labels[i], span]
+			)
+	if repaired and is_calibrated:
+		_save_calibration()
+
+
 func _flex_open_value(finger: int) -> float:
 	if finger < 0 or finger >= 5:
 		return 950.0
@@ -800,7 +852,7 @@ func get_calibrated_flex() -> Array[float]:
 	return out
 
 
-func _filter_flex(raw_flex: Array[float], delta: float) -> Array[float]:
+func _filter_flex(raw_flex: Array[float], delta: float, apply_dead_zone: bool = true) -> Array[float]:
 	var out: Array[float] = []
 	out.resize(5)
 	var alpha := 1.0
@@ -808,7 +860,7 @@ func _filter_flex(raw_flex: Array[float], delta: float) -> Array[float]:
 		alpha = 1.0 - exp(-delta / flex_smooth_time)
 	for i in 5:
 		var v := raw_flex[i]
-		if is_calibrated:
+		if is_calibrated and apply_dead_zone:
 			var dz := _flex_dead_zone_for(i)
 			if absf(v) < dz:
 				v = 0.0
@@ -845,7 +897,8 @@ func _flex_bend_range_ratio(finger_idx: int) -> float:
 func _flex_to_bend(flex_value: float, finger_idx: int, use_calibrated_delta: bool) -> float:
 	var span := _flex_span(finger_idx)
 	var effective_span := span * _flex_bend_range_ratio(finger_idx)
-	if effective_span < 1.0:
+	# 仅拒绝 corrupt span（closed>=open 时 _flex_span 返回 1）；勿用 effective_span<1 判无效
+	if span < 1.0:
 		return 0.0
 	if use_calibrated_delta:
 		return clampf(-flex_value / effective_span, 0.0, 1.0)
@@ -941,6 +994,9 @@ func _chain_weight_for(finger_idx: int, seg: int, curl_phase: float) -> float:
 
 
 func calibrate_now() -> void:
+	if _demo_mode:
+		print("Demo mode active — press T to exit before calibrating")
+		return
 	if hand_quat_raw.length_squared() < 0.1:
 		print("Calibration skipped: no quaternion data yet")
 		return
@@ -952,6 +1008,7 @@ func calibrate_now() -> void:
 		flex_rest[i] = _average_recent_flex(i)
 	is_calibrated = true
 	_reset_flex_filter_state()
+	_validate_flex_closed()
 	_save_calibration()
 
 	print(
@@ -979,6 +1036,9 @@ func calibrate_now() -> void:
 
 
 func calibrate_fist_closed() -> void:
+	if _demo_mode:
+		print("Demo mode active — press T to exit before calibrating")
+		return
 	for i in 5:
 		flex_closed_finger[i] = _average_recent_flex(i)
 	print(
@@ -988,6 +1048,7 @@ func calibrate_fist_closed() -> void:
 			flex_closed_finger[3], flex_closed_finger[4],
 		]
 	)
+	_validate_flex_closed()
 	if is_calibrated:
 		_save_calibration()
 	_reset_flex_filter_state()
@@ -1052,6 +1113,43 @@ func _apply_to_scene(delta: float) -> void:
 	var hand_quat := _model_align_quat * get_calibrated_quat()
 	var flex := _filter_flex(get_calibrated_flex(), delta)
 
+	_apply_wrist_pose(hand_quat)
+	_apply_finger_poses(flex)
+	_update_debug_label(hand_quat, flex)
+
+
+func _toggle_demo_mode() -> void:
+	_demo_mode = not _demo_mode
+	if _demo_mode:
+		_demo_bend = 0.0
+		_reset_flex_filter_state()
+		print("Demo mode ON — +/- adjust bend, T exit (no BLE needed)")
+	else:
+		_drain_udp_packets()
+		_reset_flex_filter_state()
+		print("Demo mode OFF — UDP backlog cleared")
+	_update_help_text()
+
+
+func _adjust_demo_bend(delta: float) -> void:
+	if not _demo_mode:
+		return
+	_demo_bend = clampf(_demo_bend + delta, 0.0, 1.0)
+	print("Demo bend: %.0f%%" % (_demo_bend * 100.0))
+
+
+func _demo_flex_delta() -> Array[float]:
+	var out: Array[float] = []
+	out.resize(5)
+	for i in 5:
+		var effective_span := _flex_span(i) * _flex_bend_range_ratio(i)
+		out[i] = -_demo_bend * effective_span
+	return out
+
+
+func _apply_demo_scene(delta: float) -> void:
+	var flex := _filter_flex(_demo_flex_delta(), delta, false)
+	var hand_quat := _model_align_quat * get_calibrated_quat()
 	_apply_wrist_pose(hand_quat)
 	_apply_finger_poses(flex)
 	_update_debug_label(hand_quat, flex)
@@ -1123,6 +1221,8 @@ func _zero_pose_hint() -> String:
 
 func _update_debug_label(hand_quat: Quaternion, flex: Array[float]) -> void:
 	var calib_text := "已校准" if is_calibrated else "未校准（摆好零位后按 C）"
+	if _demo_mode:
+		calib_text = "演示模式 %.0f%%" % (_demo_bend * 100.0)
 	var euler := hand_quat.get_euler()
 	var skel_text := "骨骼: OK" if _bones_ready else "骨骼: 未就绪(按P查骨骼名)"
 	debug_label.text = (
@@ -1131,7 +1231,7 @@ func _update_debug_label(hand_quat: Quaternion, flex: Array[float]) -> void:
 			+ "Packets: %d | Mount: (%.0f,%.0f,%.0f) | ModelAlign: (%.0f,%.0f,%.0f)\n"
 			+ "Euler(deg): X=%.0f Y=%.0f Z=%.0f\n"
 			+ "Flex delta: %.0f, %.0f, %.0f, %.0f, %.0f\n"
-			+ "C=校准伸直 | F=校准握拳 | R=清除 | M=安装微调 | P=打印骨骼"
+			+ "C=校准伸直 | F=校准握拳 | R=清除 | M=安装微调 | P=打印骨骼 | T=演示模式"
 		)
 		% [
 			calib_text,
@@ -1160,8 +1260,8 @@ func _update_help_text() -> void:
 		(
 			"等待 UDP 端口 %d 数据... (%.0f 秒)\n"
 			+ "%s\n\n"
-			+ "1. 将 FpsArmsHigh.fbx 拖入场景 HandModel 下\n"
-			+ "2. 摆零位后按 C 校准\n"
+			+ "1. 手模已使用 assets/scene.gltf\n"
+			+ "2. 摆零位后按 C 校准；无手套时按 T 进入演示模式（+/- 调弯拢）\n"
 			+ "3. 握紧拳后按 F 记录握拳 flex（可选，已有实测默认值）\n"
 			+ "4. 骨骼不对时按 P 查看名称并在 Inspector 填写"
 		)
@@ -1231,4 +1331,5 @@ func _load_calibration() -> void:
 
 	is_calibrated = true
 	_reset_flex_filter_state()
+	_validate_flex_closed()
 	print("Loaded glove calibration v", CALIBRATION_VERSION)
